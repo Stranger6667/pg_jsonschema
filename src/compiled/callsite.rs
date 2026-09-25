@@ -19,7 +19,7 @@ struct FnExtraCache<F: Cached> {
     stored: Vec<u8>,
     validator: Arc<jsonschema::Validator<F>>,
     info: *mut pg_sys::FmgrInfo,
-    stable_schema_arg: bool,
+    const_schema_arg: bool,
     /// MemoryContextCallback; fires `drop_fn_extra_cache` when fn_mcxt is reset.
     callback: pg_sys::MemoryContextCallback,
 }
@@ -34,10 +34,24 @@ unsafe extern "C-unwind" fn drop_fn_extra_cache<F: Cached>(arg: *mut std::ffi::c
     }
 }
 
+/// `get_fn_expr_arg_stable` also accepts `PARAM_EXTERN` params, whose value changes between
+/// calls sharing one `FmgrInfo` (e.g. a PL/pgSQL variable in a loop).
+unsafe fn schema_arg_is_const(flinfo: *mut pg_sys::FmgrInfo) -> bool {
+    unsafe {
+        let expr = (*flinfo).fn_expr;
+        if !is_a(expr, pg_sys::NodeTag::T_FuncExpr) {
+            return false;
+        }
+        let args = PgList::<pg_sys::Node>::from_pg((*expr.cast::<pg_sys::FuncExpr>()).args);
+        args.get_ptr(0)
+            .is_some_and(|arg| is_a(arg, pg_sys::NodeTag::T_Const))
+    }
+}
+
 /// Returns a compiled validator for `schema`, using a two-level cache.
 ///
 /// **L1** — per-callsite slot in `fcinfo->flinfo->fn_extra` (lifetime: `fn_mcxt`).
-/// When the schema argument is stable (immutable expression), the slot is reused
+/// When the schema argument is a constant, the slot is reused
 /// unconditionally; otherwise it is reused on a string match.
 ///
 /// **L2** — backend-local LRU (see [`super::cache`]).  Hit on L1 miss.
@@ -64,15 +78,15 @@ pub(crate) unsafe fn fn_extra_get_or_compile<F: Cached>(
             None
         };
 
-        // L1 hit: schema matches (or arg is stable, so it can't change).
+        // L1 hit: schema matches (or arg is a constant, so it can't change).
         if let Some(cached) = cached_ptr.map(|ptr| &*ptr)
-            && (cached.stable_schema_arg || cached.stored.as_slice() == schema.stored_bytes())
+            && (cached.const_schema_arg || cached.stored.as_slice() == schema.stored_bytes())
         {
             return Arc::clone(&cached.validator);
         }
 
-        // L1 miss: pay the stability check once, then refresh or allocate.
-        let stable_schema_arg = pg_sys::get_fn_expr_arg_stable(flinfo, 0);
+        // L1 miss: pay the constness check once, then refresh or allocate.
+        let const_schema_arg = schema_arg_is_const(flinfo);
 
         // Cache miss: refresh the callsite entry.
         if let Some(cached_ptr) = cached_ptr {
@@ -85,7 +99,7 @@ pub(crate) unsafe fn fn_extra_get_or_compile<F: Cached>(
                     stored: schema.stored_bytes().to_vec(),
                     validator: Arc::clone(&validator),
                     info: flinfo,
-                    stable_schema_arg,
+                    const_schema_arg,
                     callback: pg_sys::MemoryContextCallback {
                         func: Some(drop_fn_extra_cache::<F>),
                         arg: cached_ptr as *mut std::ffi::c_void,
@@ -110,7 +124,7 @@ pub(crate) unsafe fn fn_extra_get_or_compile<F: Cached>(
                 stored: schema.stored_bytes().to_vec(),
                 validator: Arc::clone(&validator),
                 info: flinfo,
-                stable_schema_arg,
+                const_schema_arg,
                 callback: pg_sys::MemoryContextCallback {
                     func: Some(drop_fn_extra_cache::<F>),
                     arg: cache_ptr as *mut std::ffi::c_void,

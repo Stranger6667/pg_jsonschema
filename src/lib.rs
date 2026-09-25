@@ -343,6 +343,32 @@ mod tests {
         assert_eq!(result, 3);
     }
 
+    // A PL/pgSQL variable is a stable argument, yet the callsite outlives its changes.
+    #[pg_test]
+    fn test_callsite_cache_plpgsql_variable_schema() {
+        Spi::run(
+            r#"
+            DO $$
+            DECLARE
+                t text;
+                results bool[] := '{}';
+            BEGIN
+                FOREACH t IN ARRAY ARRAY['{"type":"string"}', '{"type":"integer"}'] LOOP
+                    DECLARE s jsonschema := t::jsonschema;
+                    BEGIN
+                        results := results || jsonb_matches_compiled_schema(s, '42');
+                    END;
+                END LOOP;
+                IF results <> ARRAY[false, true] THEN
+                    RAISE EXCEPTION 'unexpected results: %', results;
+                END IF;
+            END
+            $$;
+            "#,
+        )
+        .unwrap();
+    }
+
     #[pg_test]
     fn test_check_constraint_with_compiled_schema() {
         Spi::run(
