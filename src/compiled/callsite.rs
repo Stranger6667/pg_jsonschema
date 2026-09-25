@@ -2,15 +2,16 @@ use std::sync::Arc;
 
 use pgrx::*;
 
-use super::{JsonSchema, cache, compile_from_str};
+use super::{SchemaArg, cache, compile_from_str};
 
-fn get_or_compile(schema: &JsonSchema) -> Arc<jsonschema::Validator> {
-    cache::get_or_insert(&schema.value, || compile_from_str(&schema.value))
+fn get_or_compile(schema: &str) -> Arc<jsonschema::Validator> {
+    cache::get_or_insert(schema, || compile_from_str(schema))
 }
 
 /// Per-callsite validator cache in `fcinfo->flinfo->fn_extra`.
 struct FnExtraCache {
-    schema: String,
+    /// The schema datum as stored, compared before anything is detoasted or decoded.
+    stored: Vec<u8>,
     validator: Arc<jsonschema::Validator>,
     info: *mut pg_sys::FmgrInfo,
     stable_schema_arg: bool,
@@ -47,7 +48,7 @@ unsafe extern "C-unwind" fn drop_fn_extra_cache(arg: *mut std::ffi::c_void) {
 /// # Safety
 /// `fcinfo` must be a valid, non-null `FunctionCallInfo` for the current call.
 pub(crate) unsafe fn fn_extra_get_or_compile(
-    schema: &JsonSchema,
+    schema: &SchemaArg,
     fcinfo: pg_sys::FunctionCallInfo,
 ) -> Arc<jsonschema::Validator> {
     unsafe {
@@ -60,7 +61,7 @@ pub(crate) unsafe fn fn_extra_get_or_compile(
 
         // L1 hit: schema matches (or arg is stable, so it can't change).
         if let Some(cached) = cached_ptr.map(|ptr| &*ptr)
-            && (cached.stable_schema_arg || cached.schema.as_str() == schema.value.as_str())
+            && (cached.stable_schema_arg || cached.stored.as_slice() == schema.stored_bytes())
         {
             return Arc::clone(&cached.validator);
         }
@@ -71,12 +72,12 @@ pub(crate) unsafe fn fn_extra_get_or_compile(
         // Cache miss: refresh the callsite entry.
         if let Some(cached_ptr) = cached_ptr {
             let cached = &mut *cached_ptr;
-            let validator = get_or_compile(schema);
+            let validator = get_or_compile(&schema.decode().value);
             let next = cached.callback.next;
             let old_entry = std::mem::replace(
                 cached,
                 FnExtraCache {
-                    schema: schema.value.clone(),
+                    stored: schema.stored_bytes().to_vec(),
                     validator: Arc::clone(&validator),
                     info: flinfo,
                     stable_schema_arg,
@@ -92,7 +93,7 @@ pub(crate) unsafe fn fn_extra_get_or_compile(
         }
 
         // Cold path: allocate in fn_mcxt.
-        let validator = get_or_compile(schema);
+        let validator = get_or_compile(&schema.decode().value);
         let fn_mcxt = (*flinfo).fn_mcxt;
         let old_mcxt = pg_sys::MemoryContextSwitchTo(fn_mcxt);
 
@@ -100,7 +101,7 @@ pub(crate) unsafe fn fn_extra_get_or_compile(
         std::ptr::write(
             cache_ptr,
             FnExtraCache {
-                schema: schema.value.clone(),
+                stored: schema.stored_bytes().to_vec(),
                 validator: Arc::clone(&validator),
                 info: flinfo,
                 stable_schema_arg,
